@@ -1,0 +1,409 @@
+import { balancerService } from '../balancer-subgraph/balancer.service';
+import { masterchefService } from '../masterchef-subgraph/masterchef.service';
+import {
+    BalancerJoinExitFragment,
+    BalancerPoolFragment,
+    BalancerPoolTokenFragment,
+    BalancerUserFragment,
+    InvestType,
+} from '../balancer-subgraph/generated/balancer-subgraph-types';
+import { FarmUserFragment } from '../masterchef-subgraph/generated/masterchef-subgraph-types';
+import { BigNumber } from 'ethers';
+import { bn, fromFp } from '../util/numbers';
+import _ from 'lodash';
+import { TokenPrices } from '../token-price/token-price-types';
+import { tokenPriceService } from '../token-price/token-price.service';
+import { blocksSubgraphService } from '../blocks-subgraph/blocks-subgraph.service';
+import { UserPoolData, UserPortfolioData, UserTokenData } from './portfolio-types';
+import moment from 'moment-timezone';
+import { GqlBalancerPool, GqlUserPortfolioData, GqlUserTokenData } from '../../schema';
+import { balancerTokenMappings } from '../token-price/lib/balancer-token-mappings';
+import { env } from '../../app/env';
+//import { embrPitService } from '../embr-pit-subgraph/embr-pit.service';
+//import { EmbrPitFragment, EmbrPitUserFragment } from '../embr-pit-subgraph/generated/embr-pit-subgraph-types';
+
+class PortfolioService {
+    constructor() {}
+
+    public async getPortfolio(address: string): Promise<UserPortfolioData> {
+        const previousBlock = await blocksSubgraphService.getBlockFrom24HoursAgo();
+        const { user, pools, previousUser, previousPools } = await balancerService.getPortfolioData(
+            address,
+            parseInt(previousBlock.number),
+        );
+        const { farmUsers, previousFarmUsers } = await masterchefService.getPortfolioData({
+            address,
+            previousBlockNumber: parseInt(previousBlock.number),
+        });
+        //const { embrPitUser, previousEmbrPitUser, embrPit, previousEmbrPit } =
+        //    await embrPitService.getPortfolioData(address, parseInt(previousBlock.number));
+        const tokenPrices = await tokenPriceService.getTokenPrices();
+        const historicalTokenPrices = await tokenPriceService.getHistoricalTokenPrices();
+        const previousTokenPrices = tokenPriceService.getTokenPricesForTimestamp(
+            previousBlock.timestamp,
+            historicalTokenPrices,
+        );
+
+        if (!user) {
+            return {
+                pools: [],
+                tokens: [],
+                totalValue: 0,
+                totalSwapFees: 0,
+                totalSwapVolume: 0,
+                timestamp: 0,
+                myFees: 0,
+            };
+        }
+
+        const poolData = this.getUserPoolData(
+            user,
+            previousUser || user,
+            pools,
+            previousPools,
+            farmUsers,
+            previousFarmUsers,
+            tokenPrices,
+            previousTokenPrices,
+            //embrPit,
+            //previousEmbrPit,
+            //embrPitUser,
+            //previousEmbrPitUser,
+        );
+        const tokens = this.tokensFromUserPoolData(poolData);
+
+        return {
+            pools: poolData,
+            tokens,
+            timestamp: moment().unix(),
+            totalValue: _.sumBy(poolData, 'totalValue'),
+            totalSwapFees: _.sumBy(poolData, 'swapFees'),
+            totalSwapVolume: _.sumBy(poolData, 'swapVolume'),
+            myFees: _.sumBy(poolData, 'myFees'),
+        };
+    }
+
+    public async getPortfolioHistory(address: string): Promise<UserPortfolioData[]> {
+        const historicalTokenPrices = await tokenPriceService.getHistoricalTokenPrices();
+        const blocks = await blocksSubgraphService.getDailyBlocks(30);
+        const portfolioHistories: UserPortfolioData[] = [];
+
+        for (let i = 0; i < blocks.length - 1; i++) {
+            const block = blocks[i];
+            const previousBlock = blocks[i + 1];
+            const blockNumber = parseInt(block.number);
+
+            const tokenPrices = tokenPriceService.getTokenPricesForTimestamp(block.timestamp, historicalTokenPrices);
+            const user = await balancerService.getUserAtBlock(address, blockNumber);
+            const allFarmUsers = await masterchefService.getAllFarmUsersAtBlock(blockNumber);
+            const pools = await balancerService.getAllPoolsAtBlock(blockNumber);
+            const previousPools = await balancerService.getAllPoolsAtBlock(parseInt(previousBlock.number));
+            const allPreviousFarmUsers = await masterchefService.getAllFarmUsersAtBlock(parseInt(previousBlock.number));
+            const previousUser = await balancerService.getUserAtBlock(address, parseInt(previousBlock.number));
+            const previousTokenPrices = tokenPriceService.getTokenPricesForTimestamp(
+                previousBlock.timestamp,
+                historicalTokenPrices,
+            );
+           // const embrPit = await embrPitService.getEmbrPit(blockNumber);
+           // const previousEmbrPit = await embrPitService.getEmbrPit(parseInt(previousBlock.number));
+           // const embrPitUser = await embrPitService.getUserAtBlock(address, blockNumber);
+           // const previousEmbrPitUser = await embrPitService.getUserAtBlock(address, parseInt(previousBlock.number));
+            //const allJoinExits = await balancerService.getAllJoinExitsAtBlock(blockNumber);
+
+            if (user && previousUser) {
+                const farmUsers = allFarmUsers.filter((famUser) => famUser.address === user.id);
+                const previousFarmUsers = allPreviousFarmUsers.filter((famUser) => famUser.address === user.id);
+                const poolData = this.getUserPoolData(
+                    user,
+                    previousUser,
+                    pools,
+                    previousPools,
+                    farmUsers,
+                    previousFarmUsers,
+                    tokenPrices,
+                    previousTokenPrices,
+                    //embrPit,
+                    //previousEmbrPit,
+                    //embrPitUser,
+                    //previousEmbrPitUser,
+                );
+                const tokens = this.tokensFromUserPoolData(poolData);
+                //const joinExits = allJoinExits.filter((joinExit) => joinExit.user.id === user.id);
+                //const summedJoinExits = this.sumJoinExits(joinExits, tokenPrices);
+
+                const totalValue = _.sumBy(poolData, 'totalValue');
+
+                if (totalValue > 0) {
+                    portfolioHistories.push({
+                        tokens,
+                        pools: poolData,
+                        //this data represents the previous day
+                        timestamp: moment.unix(parseInt(block.timestamp)).subtract(1, 'day').unix(),
+                        totalValue,
+                        totalSwapFees: _.sumBy(poolData, 'swapFees'),
+                        totalSwapVolume: _.sumBy(poolData, 'swapVolume'),
+                        myFees: _.sumBy(poolData, 'myFees'),
+                    });
+                }
+            }
+        }
+
+        return portfolioHistories;
+    }
+
+    public getUserPoolData(
+        balancerUser: BalancerUserFragment,
+        previousBalancerUser: BalancerUserFragment,
+        pools: BalancerPoolFragment[],
+        previousPools: BalancerPoolFragment[],
+        userFarms: FarmUserFragment[],
+        previousUserFarms: FarmUserFragment[],
+        tokenPrices: TokenPrices,
+        previousTokenPrices: TokenPrices,
+        //embrPit: EmbrPitFragment,
+        //previousEmbrPit: EmbrPitFragment,
+        //embrPitUser: EmbrPitUserFragment | null,
+        //previousEmbrPitUser: EmbrPitUserFragment | null,
+    ): UserPoolData[] {
+        const userPoolData: Omit<UserPoolData, 'percentOfPortfolio'>[] = [];
+
+        for (const pool of pools) {
+            //if no previous pool, it means this pool is less than 24 hours old. Use the current pool so we get zeros
+            const previousPool = previousPools.find((previousPool) => previousPool.id === pool.id) || pool;
+
+            const { userNumShares, userPercentShare, userTotalValue, userTokens, pricePerShare } =
+                this.generatePoolIntermediates(pool, balancerUser, userFarms, tokenPrices);//, embrPit, embrPitUser);
+            const previous = this.generatePoolIntermediates(
+                previousPool,
+                previousBalancerUser,
+                previousUserFarms,
+                previousTokenPrices//,
+               // previousEmbrPit,
+                //previousEmbrPitUser,
+            );
+
+            const swapFees = parseFloat(pool.totalSwapFee) - parseFloat(previousPool.totalSwapFee);
+
+            if (userNumShares > 0) {
+                userPoolData.push({
+                    id: pool.id,
+                    poolId: pool.id,
+                    poolAddress: pool.address,
+                    name: pool.name || '',
+                    shares: userNumShares,
+                    percentShare: userPercentShare,
+                    totalValue: userTotalValue,
+                    pricePerShare: Number.isNaN(userTotalValue / userNumShares) === true ? 0 : userTotalValue / userNumShares,
+                    tokens: userTokens.map((token) => ({
+                        ...token,
+                        percentOfPortfolio:  Number.isNaN(token.totalValue / userTotalValue) === true ? 0 : token.totalValue / userTotalValue,
+                    })),
+                    swapFees,
+                    swapVolume: parseFloat(pool.totalSwapVolume) - parseFloat(previousPool.totalSwapVolume),
+                    myFees: swapFees * userPercentShare,
+                    priceChange:
+                        pricePerShare && previous.pricePerShare
+                            ? userNumShares * pricePerShare - userNumShares * previous.pricePerShare
+                            : 0,
+                    priceChangePercent:
+                        pricePerShare && previous.pricePerShare
+                            ? (pricePerShare - previous.pricePerShare) / pricePerShare
+                            : 0,
+                });
+            }
+        }
+
+        const totalValue = _.sumBy(userPoolData, 'totalValue');
+
+        return _.orderBy(userPoolData, 'totalValue', 'desc').map((pool) => ({
+            ...pool,
+            percentOfPortfolio: pool.totalValue / totalValue,
+        }));
+    }
+
+    public async getCachedPools(): Promise<GqlBalancerPool[]> {
+        const blocks = await blocksSubgraphService.getDailyBlocks(30);
+        let balancePools: GqlBalancerPool[] = [];
+
+        for (let i = 0; i < blocks.length - 1; i++) {
+            const block = blocks[i];
+            const blockNumber = parseInt(block.number);
+
+            const pools = await balancerService.getAllPoolsAtBlock(blockNumber);
+            balancePools = [
+                ...balancePools,
+                ...pools.map((pool) => ({
+                    ...pool,
+                    __typename: 'GqlBalancerPool' as const,
+                    block: block.number,
+                    timestamp: block.timestamp,
+                })),
+            ];
+        }
+
+        return balancePools;
+    }
+
+    private mapPoolTokenToUserPoolTokenData(
+        token: BalancerPoolTokenFragment,
+        percentShare: number,
+        tokenPrices: TokenPrices,
+    ): Omit<UserTokenData, 'percentOfPortfolio'> {
+        const pricePerToken = tokenPrices[token.address.toLowerCase()]?.usd || 0;
+        const balance = parseFloat(token.balance) * percentShare;
+
+        return {
+            id: token.id,
+            address: token.address || '',
+            symbol: balancerTokenMappings.tokenSymbolOverwrites[token.symbol || ''] || token.symbol || '',
+            name: token.name || '',
+            pricePerToken,
+            balance,
+            totalValue: pricePerToken * balance,
+        };
+    }
+
+    private tokensFromUserPoolData(data: UserPoolData[]): UserTokenData[] {
+        const allTokens = _.flatten(data.map((item) => item.tokens));
+        const groupedTokens = _.groupBy(allTokens, 'symbol');
+        const poolsTotalValue = _.sumBy(data, 'totalValue');
+
+        const tokens = _.map(groupedTokens, (group) => {
+            const totalValue = _.sumBy(group, (token) => token.totalValue);
+
+            return {
+                ...group[0],
+                balance: _.sumBy(group, (token) => token.balance),
+                totalValue,
+                percentOfPortfolio: Number.isNaN(totalValue / poolsTotalValue) === true ? 0 : totalValue / poolsTotalValue,
+            };
+        });
+
+        return _.orderBy(tokens, 'totalValue', 'desc');
+    }
+
+    private sumJoinExits(
+        joinExits: BalancerJoinExitFragment[],
+        tokenPrices: TokenPrices,
+    ): { token: string; balance: number; totalValue: number }[] {
+        const tokensWithAmounts = _.flatten(
+            joinExits.map((joinExit) =>
+                joinExit.amounts.map((amount, idx) => ({
+                    amount,
+                    token: joinExit.pool.tokensList[idx],
+                    type: joinExit.type,
+                })),
+            ),
+        );
+
+        const grouped = _.groupBy(tokensWithAmounts, 'token');
+
+        return _.map(grouped, (token, address) => {
+            const balance = _.sumBy(
+                token,
+                (item) => parseFloat(item.amount) * (item.type === InvestType.Exit ? -1 : 1),
+            );
+            const pricePerToken = tokenPrices[address.toLowerCase()]?.usd || 0;
+
+            return {
+                token: address,
+                balance,
+                totalValue: balance * pricePerToken,
+            };
+        });
+    }
+
+    private generatePoolIntermediates(
+        pool: BalancerPoolFragment,
+        balancerUser: BalancerUserFragment,
+        userFarms: FarmUserFragment[],
+        tokenPrices: TokenPrices,
+        //embrPit: EmbrPitFragment,
+        //embrPitUser: EmbrPitUserFragment | null,
+    ) {
+        //const embrPitSharesForPool = this.getUserEmbrPitSharesForPool(pool, userFarms, embrPit, embrPitUser);
+        const sharesOwned = balancerUser.sharesOwned?.find((shares) => shares.poolId.id === pool.id);
+        const userFarm = userFarms.find((userFarm) => userFarm.pool?.pair === pool.address);
+        const userNumShares =
+            parseFloat(sharesOwned?.balance || '0') +
+            fromFp(BigNumber.from(userFarm?.amount || 0)).toNumber()// +
+           // embrPitSharesForPool;
+        const poolTotalShares = parseFloat(pool.totalShares);
+        const poolTotalValue = this.getPoolValue(pool, tokenPrices);
+        const userPercentShare =  Number.isNaN(userNumShares / poolTotalShares) === true ? 0 : userNumShares / poolTotalShares;
+        const userTokens = _.orderBy(
+            (pool.tokens || []).map((token) =>
+                this.mapPoolTokenToUserPoolTokenData(token, userPercentShare, tokenPrices),
+            ),
+            'totalValue',
+            'desc',
+        );
+        const userTotalValue = _.sumBy(userTokens, (token) => token.totalValue);
+
+        return {
+            userNumShares,
+            userPercentShare,
+            userTokens,
+            userTotalValue,
+            pricePerShare: Number.isNaN(poolTotalValue / poolTotalShares) ? 0 : poolTotalValue / poolTotalShares,
+            poolTotalValue,
+            poolTotalShares,
+        };
+    }
+
+    private getUserEmbrPitSharesForPool(
+        pool: BalancerPoolFragment,
+        userFarms: FarmUserFragment[],
+        //embrPit: EmbrPitFragment,
+        //embrPitUser: EmbrPitUserFragment | null,
+    ): number {
+        if (pool.id !== env.CEMBR_POOL_ID) {
+            return 0;
+        }
+
+        const userCembrFarm = userFarms.find((userFarm) => userFarm.pool?.pair === env.CEMBR_ADDRESS);
+        const userStakedCembr = fromFp(userCembrFarm?.amount || '0').toNumber();
+        //const userCembr = parseFloat(embrPitUser?.cEmbr || '0');
+
+        return 0 //(userStakedCembr + userCembr) * parseFloat(embrPit.ratio);
+    }
+
+    private getPoolValue(pool: BalancerPoolFragment, tokenPrices: TokenPrices): number {
+        return _.sum(
+            (pool.tokens || []).map((token) => parseFloat(token.balance) * (tokenPrices[token.address]?.usd || 0)),
+        );
+    }
+
+    public mapPortfolioDataToGql(data: UserPortfolioData): GqlUserPortfolioData {
+        return {
+            ...data,
+            totalValue: `${data.totalValue}`,
+            totalSwapFees: `${data.totalSwapFees}`,
+            totalSwapVolume: `${data.totalSwapVolume}`,
+            myFees: `${data.myFees}`,
+            pools: data.pools.map((pool) => ({
+                ...pool,
+                totalValue: `${pool.totalValue}`,
+                swapFees: `${pool.swapFees}`,
+                swapVolume: `${pool.swapVolume}`,
+                myFees: `${pool.myFees}`,
+                priceChange: `${pool.priceChange}`,
+                pricePerShare: `${pool.pricePerShare}`,
+                shares: `${pool.shares}`,
+                tokens: pool.tokens.map((token) => this.mapUserTokenDataToGql(token)),
+            })),
+            tokens: data.tokens.map((token) => this.mapUserTokenDataToGql(token)),
+        };
+    }
+
+    private mapUserTokenDataToGql(token: UserTokenData): GqlUserTokenData {
+        return {
+            ...token,
+            balance: `${token.balance}`,
+            pricePerToken: `${token.pricePerToken}`,
+            totalValue: `${token.totalValue}`,
+        };
+    }
+}
+
+export const portfolioService = new PortfolioService();
